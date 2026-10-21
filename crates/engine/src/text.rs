@@ -11,6 +11,8 @@ use ab_glyph::{Font, FontRef, Glyph, PxScale, ScaleFont, point};
 
 /// Inter SemiBold (OFL, see assets/ATTRIBUTION.md).
 pub static TEXT_FONT: &[u8] = include_bytes!("../../../assets/fonts/Inter-SemiBold.ttf");
+/// Inter Regular (OFL, see assets/ATTRIBUTION.md): the watermark's regular weight.
+pub static TEXT_FONT_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
 
 /// Most characters one layout draws (longer text is cut there), so hostile text stays cheap.
 pub const MAX_CHARS: usize = 4000;
@@ -20,9 +22,14 @@ pub const MAX_CHARS: usize = 4000;
 /// offered). Without craft-fonts that is Inter alone, and CJK characters draw as Inter's
 /// missing-glyph box.
 pub fn faces(craft: &'static [crate::fonts::CraftFont]) -> Vec<FontRef<'static>> {
+    faces_with(craft, TEXT_FONT)
+}
+
+/// [`faces`] with `latin` (an Inter face) first: the watermark's regular or bold weight.
+pub fn faces_with(craft: &'static [crate::fonts::CraftFont], latin: &'static [u8]) -> Vec<FontRef<'static>> {
     let mut cjk: Vec<_> = crate::fonts::cjk(craft).collect();
     cjk.sort_by_key(|f| !f.is_mincho());
-    std::iter::once(TEXT_FONT).chain(cjk.into_iter().map(|f| f.bytes)).filter_map(|bytes| FontRef::try_from_slice(bytes).ok()).collect()
+    std::iter::once(latin).chain(cjk.into_iter().map(|f| f.bytes)).filter_map(|bytes| FontRef::try_from_slice(bytes).ok()).collect()
 }
 
 /// Shape a whole grapheme in one cell. CJK uses vertical origins and forms; Latin stays upright.
@@ -67,6 +74,12 @@ impl TextLayout {
     /// `text` (cut at [`MAX_CHARS`]) at `px` pixels a line; `None` when there is nothing to draw
     /// (empty text, a non-finite or non-positive size).
     pub fn new(text: &str, px: f32, vertical: bool, craft: &'static [crate::fonts::CraftFont]) -> Option<TextLayout> {
+        Self::with_face(text, px, vertical, craft, TEXT_FONT)
+    }
+
+    /// [`TextLayout::new`] with `latin` (an Inter face) as the first face: the watermark's regular
+    /// or bold weight.
+    pub fn with_face(text: &str, px: f32, vertical: bool, craft: &'static [crate::fonts::CraftFont], latin: &'static [u8]) -> Option<TextLayout> {
         use unicode_segmentation::UnicodeSegmentation;
         if text.is_empty() || !px.is_finite() || px <= 0.0 {
             return None;
@@ -75,7 +88,7 @@ impl TextLayout {
             Some((i, _)) => text.get(..i).unwrap_or(text),
             None => text,
         };
-        let fonts = faces(craft);
+        let fonts = faces_with(craft, latin);
         let latin = fonts.first()?.clone();
         let vertical_data: Vec<_> = if vertical {
             fonts.iter().map(|font| harfrust::FontRef::new(font.font_data()).ok().map(|face| harfrust::ShaperData::new(&face))).collect()

@@ -974,6 +974,25 @@ impl Catalog {
         })
     }
 
+    /// Ops that remove album or folder `id` with everything inside it (its albums and folders,
+    /// innermost first, so each folder is empty when it goes): one undoable batch. The photos stay
+    /// in the library.
+    pub fn delete_album_tree_ops(&self, id: AlbumId) -> Op {
+        // breadth-first from the folder, each album seen once (a damaged catalog can't loop us)
+        let mut order = vec![id];
+        let mut seen: std::collections::HashSet<AlbumId> = std::collections::HashSet::from([id]);
+        let mut i = 0;
+        while let Some(&parent) = order.get(i) {
+            for a in self.albums.values().filter(|a| a.parent == Some(parent)) {
+                if seen.insert(a.id) {
+                    order.push(a.id);
+                }
+            }
+            i += 1;
+        }
+        Op::Batch { ops: order.into_iter().rev().map(|id| Op::RemoveAlbum { id }).collect() }
+    }
+
     /// Ops that remove a photo permanently including album and stack memberships (one undoable
     /// batch).
     pub fn delete_permanently_ops(&self, id: PhotoId) -> Op {

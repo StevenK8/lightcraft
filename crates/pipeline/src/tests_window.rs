@@ -196,7 +196,7 @@ fn mask_edge_refinement_does_not_depend_on_the_window() {
     let mut s = DevelopSettings::default();
     s.masks.push(Mask {
         id: 1,
-        components: vec![MaskComponent { name: None, op: MaskOp::Add, invert: false, shape }],
+        components: vec![MaskComponent { hidden: false, name: None, op: MaskOp::Add, invert: false, shape }],
         adjust: LocalAdjustments { exposure: 1.5, ..Default::default() },
         refine: 100.0,
         ..Default::default()
@@ -221,7 +221,7 @@ fn a_mask_overlay_window_matches_the_whole_render() {
         let mut s = DevelopSettings::default();
         s.masks.push(Mask {
             id: 3,
-            components: vec![MaskComponent { name: None, op: MaskOp::Add, invert: false, shape }],
+            components: vec![MaskComponent { hidden: false, name: None, op: MaskOp::Add, invert: false, shape }],
             adjust: LocalAdjustments { exposure: 1.0, ..Default::default() },
             refine,
             ..Default::default()
@@ -254,7 +254,7 @@ fn an_all_masks_overlay_window_matches_the_whole_render() {
     for (id, shape, refine) in shapes {
         s.masks.push(Mask {
             id,
-            components: vec![MaskComponent { name: None, op: MaskOp::Add, invert: false, shape }],
+            components: vec![MaskComponent { hidden: false, name: None, op: MaskOp::Add, invert: false, shape }],
             adjust: LocalAdjustments { exposure: 1.0, ..Default::default() },
             refine,
             ..Default::default()
@@ -399,7 +399,7 @@ fn auto_mask_strokes_match_the_whole_render() {
     let strokes = vec![st(&[(0.2, 0.55), (0.5, 0.6), (0.8, 0.5)], true, false), st(&[(0.5, 0.58)], true, true)];
     let s = DevelopSettings {
         masks: vec![Mask {
-            components: vec![MaskComponent { name: None, op: MaskOp::Add, invert: false, shape: MaskShape::Brush { strokes } }],
+            components: vec![MaskComponent { hidden: false, name: None, op: MaskOp::Add, invert: false, shape: MaskShape::Brush { strokes } }],
             adjust: LocalAdjustments { exposure: 1.0, saturation: -50.0, ..Default::default() },
             ..Default::default()
         }],

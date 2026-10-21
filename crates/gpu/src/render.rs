@@ -604,11 +604,19 @@ pub fn render(
         Some(crate::Fault::Limit(bytes)) => Some(crate::ctx::LimitOverride::new(bytes)),
         _ => None,
     };
+    let max_pixels = match fault {
+        Some(crate::Fault::Pixels(px)) => px.min(gpu.max_pixels),
+        _ => gpu.max_pixels,
+    };
     if !gpu.fits(n * 3) {
         fail(
             FailKind::Limit,
             format!("{w}×{h} needs {} MiB buffers, over the device's {} MiB storage-buffer limit", (n * 12).div_ceil(1 << 20), gpu.limit() >> 20),
         );
+        return None;
+    }
+    if n > max_pixels {
+        fail(FailKind::Limit, format!("{w}×{h} is over the {max_pixels} pixels this device's GPU renders correctly (limit)"));
         return None;
     }
     let s = &*plan.settings;
@@ -621,7 +629,7 @@ pub fn render(
     let sampled = match &cached {
         Some(e) => e.sampled.clone(),
         // (a WarpRectilinear2 chain also goes to the CPU: its degree-14 polynomial needs f64)
-        None if gpu.fits(src.data.len() * 3) && !plan.frame.warp.as_ref().is_some_and(|w| w.needs_f64()) => {
+        None if gpu.fits(src.data.len() * 3) && src.data.len() <= max_pixels && !plan.frame.warp.as_ref().is_some_and(|w| w.needs_f64()) => {
             let upload = || gpu.upload(rgb_words(src));
             // (a source too big for a view's stages to keep is the one shared copy: a window is
             // cut from the photo's own pixels, and what its stages keep is its own sampled pixels)
@@ -912,19 +920,22 @@ fn prepare(cx: &mut Cx<'_>, lin: &Buf, plan: &Plan<'_>, req: &RenderRequest, pla
 /// Most brush dabs the mask kernel evaluates per pixel (more: the CPU rasterizes the brush).
 const MAX_DABS: usize = 4096;
 
-/// The `shape` kernel's brush data for `dabs`: stroke records (12 words: dab offset, dab count,
-/// r, hard, flow, density, erase, bbox x0 y0 x1 y1, auto) then the dab centres.
+/// The `shape` kernel's brush data for `dabs`: stroke records (17 words: dab offset, dab count,
+/// r, hard, flow, density, erase, bbox x0 y0 x1 y1, auto, spread, core, edge width, strength,
+/// norm) then the dab centres.
 fn brush_aux(dabs: &[&lightcraft_pipeline::masks::BrushDabs], erase: bool) -> Vec<f32> {
     let mut aux = Vec::new();
-    let mut off = 12 * dabs.len();
+    let mut off = 17 * dabs.len();
     for d in dabs {
+        let reach = if d.spread { d.r * f64::from(d.fade.0 + lightcraft_pipeline::masks::SPREAD_REACH * d.fade.1) } else { d.r };
         let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
         for q in &d.dabs {
-            (x0, y0, x1, y1) = (x0.min(q.x - d.r), y0.min(q.y - d.r), x1.max(q.x + d.r), y1.max(q.y + d.r));
+            (x0, y0, x1, y1) = (x0.min(q.x - reach), y0.min(q.y - reach), x1.max(q.x + reach), y1.max(q.y + reach));
         }
         aux.extend([off as f32, d.dabs.len() as f32, d.r as f32, d.hard as f32, d.flow, d.density, (erase && d.erase) as u8 as f32]);
         aux.extend([x0, y0, x1, y1].map(|v| v as f32));
         aux.push(d.auto as u8 as f32);
+        aux.extend([d.spread as u8 as f32, d.fade.0, d.fade.1, d.strength, d.norm]);
         off += 2 * d.dabs.len();
     }
     for d in dabs {
@@ -973,7 +984,7 @@ fn masks(cx: &mut Cx<'_>, lin: &Buf, prep: &Prep, plan: &Plan<'_>, host: &mut Ho
     let comp_plane = cx.gpu.buffer(n);
     for (mi, m) in list.iter().enumerate() {
         let mut first = true;
-        for comp in &m.components {
+        for comp in m.components.iter().filter(|c| !c.hidden) {
             let op = match comp.op {
                 _ if first && comp.op != MaskOp::Intersect => 0u32,
                 MaskOp::Add => 1,
@@ -1000,15 +1011,21 @@ fn masks(cx: &mut Cx<'_>, lin: &Buf, prep: &Prep, plan: &Plan<'_>, host: &mut Ho
                     p.push(*invert as u32);
                     Some(1)
                 }
-                MaskShape::LuminanceRange { lo, hi, lo_feather, hi_feather } => {
+                MaskShape::LuminanceRange { lo, hi, lo_feather, hi_feather, ranked, ranks, .. } => {
                     p.extend(f32s(&[*lo, *hi, lo_feather.max(1e-3), hi_feather.max(1e-3)]));
                     p.push(ev.to_bits());
+                    let table = ranks.as_deref().filter(|r| *ranked && r.len() > 1);
+                    p.push(table.map_or(0, |r| r.len() as u32));
+                    aux.extend(table.into_iter().flatten());
                     Some(2)
                 }
-                MaskShape::ColorRange { samples, refine } => {
-                    let tol = lightcraft_pipeline::masks::color_range_tolerance(*refine);
-                    p.extend([tol.to_bits(), ev.exp2().to_bits(), samples.len() as u32]);
-                    aux.extend(samples.iter().flat_map(|s| s.map(|v| v as f32)));
+                MaskShape::ColorRange { samples, refine, area, hue_first, .. } => {
+                    let sel = lightcraft_pipeline::masks::color_select(samples, *refine, area.as_ref(), *hue_first);
+                    p.extend([sel.tol.to_bits(), ev.exp2().to_bits(), sel.boxes.len() as u32, sel.full.to_bits(), u32::from(sel.toned)]);
+                    for (b, w) in sel.boxes.iter().zip(&sel.l_weights) {
+                        aux.extend(b.iter().flatten());
+                        aux.push(*w);
+                    }
                     Some(3)
                 }
                 MaskShape::Brush { strokes } => {

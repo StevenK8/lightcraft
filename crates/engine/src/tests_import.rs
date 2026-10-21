@@ -1151,6 +1151,29 @@ fn a_fresh_reimport_reads_its_own_stem_sidecar() {
     let _ = std::fs::remove_dir_all(&src);
 }
 
+/// `duplicates: import` (the phone's "import the duplicate"): a file with the same content as a
+/// library photo comes in as a new photo; by path it is still skipped; anything else is an error.
+#[test]
+fn import_can_take_a_duplicate_on_request() {
+    let src = temp_dir("dup-import");
+    write_png(&src.join("a.png"), 1);
+    std::fs::copy(src.join("a.png"), src.join("a-again.png")).unwrap();
+    let mut s = Session::new().with_fs();
+    let a = src.join("a.png").to_string_lossy().to_string();
+    let again = src.join("a-again.png").to_string_lossy().to_string();
+    s.execute("library.import", &json!({"paths": [a]})).unwrap();
+    let skipped = s.execute("library.import", &json!({"paths": [again]})).unwrap();
+    assert_eq!((ids(&skipped, "imported"), ids(&skipped, "duplicates")), (0, 1), "{skipped}");
+    let r = s.execute("library.import", &json!({"paths": [again], "duplicates": "import"})).unwrap();
+    assert_eq!((ids(&r, "imported"), ids(&r, "duplicates")), (1, 0), "{r}");
+    assert_eq!(s.catalog.len(), 2);
+    let r = s.execute("library.import", &json!({"paths": [a], "duplicates": "import"})).unwrap();
+    assert_eq!(r["duplicates"][0]["reason"], "path", "{r}");
+    let e = s.execute("library.import", &json!({"paths": [a], "duplicates": "always"})).unwrap_err().to_string();
+    assert!(e.contains("skip|import"), "{e}");
+    let _ = std::fs::remove_dir_all(&src);
+}
+
 #[test]
 fn unknown_on_deleted_is_an_error() {
     let mut s = Session::new().with_fs();

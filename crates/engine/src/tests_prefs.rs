@@ -85,6 +85,11 @@ fn raw_and_other_defaults_are_applied_on_import() {
     let p = s.catalog.photo(id).unwrap();
     assert_eq!(p.develop.light.exposure, 0.5);
     assert!(!p.is_edited());
+    // the phone's Reset › All goes past the import look, To Import back to it
+    s.execute("develop.reset", &json!({"to": "default"})).unwrap();
+    assert_eq!(s.catalog.photo(id).unwrap().develop.light.exposure, 0.0);
+    s.execute("develop.reset", &json!({"to": "import"})).unwrap();
+    assert_eq!(s.catalog.photo(id).unwrap().develop.light.exposure, 0.5);
 
     // per-camera off: the Canon gets the global raw default; clearing it gives the plain defaults
     let mut s2 = Session::new().with_fs();

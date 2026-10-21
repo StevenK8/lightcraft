@@ -20,18 +20,14 @@ fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-/// Parametric region curve (encoded domain) composed with the master point curve.
-fn curve_luts(c: &ToneCurve) -> Option<[Lut1; 3]> {
-    let parametric = c.highlights != 0.0 || c.lights != 0.0 || c.darks != 0.0 || c.shadows != 0.0;
-    let master = !ToneCurve::point_curve_is_identity(&c.master);
-    let chans = [&c.red, &c.green, &c.blue].map(|p| !ToneCurve::point_curve_is_identity(p));
-    if !parametric && !master && !chans.iter().any(|b| *b) {
-        return None;
-    }
-    const N: usize = 1024;
+/// The parametric region curve on its own (encoded domain): the Shadows/Highlights sliders and the
+/// region splits between them, kept monotone. The render composes it with the point curves
+/// ([`curve_luts`]); frontends draw it to show what the sliders do.
+pub fn parametric_curve(c: &ToneCurve, n: usize) -> Lut1 {
+    let n = n.max(2);
     let (s1, s2, s3) = ((c.split_shadows / 100.0) as f32, (c.split_mid / 100.0) as f32, (c.split_highlights / 100.0) as f32);
     let regions = [(0.0, s1, c.shadows), (s1, s2, c.darks), (s2, s3, c.lights), (s3, 1.0, c.highlights)];
-    let mut base = Lut1::from_fn(N, |x| {
+    let mut base = Lut1::from_fn(n, |x| {
         let mut d = 0.0;
         for (a, b, amt) in regions {
             if amt == 0.0 {
@@ -45,9 +41,22 @@ fn curve_luts(c: &ToneCurve) -> Option<[Lut1; 3]> {
         (x + d * 4.0 * x * (1.0 - x)).clamp(0.0, 1.0)
     });
     // keep monotone
-    for i in 1..N {
+    for i in 1..n {
         base.v[i] = base.v[i].max(base.v[i - 1]);
     }
+    base
+}
+
+/// Parametric region curve (encoded domain) composed with the master point curve.
+fn curve_luts(c: &ToneCurve) -> Option<[Lut1; 3]> {
+    let parametric = c.highlights != 0.0 || c.lights != 0.0 || c.darks != 0.0 || c.shadows != 0.0;
+    let master = !ToneCurve::point_curve_is_identity(&c.master);
+    let chans = [&c.red, &c.green, &c.blue].map(|p| !ToneCurve::point_curve_is_identity(p));
+    if !parametric && !master && !chans.iter().any(|b| *b) {
+        return None;
+    }
+    const N: usize = 1024;
+    let mut base = parametric_curve(c, N);
     let to_pts = |p: &[Point]| p.iter().map(|q| (q.x, q.y)).collect::<Vec<_>>();
     if master {
         base = MonotoneCurve::new(&to_pts(&c.master)).to_lut(N).compose(&base);

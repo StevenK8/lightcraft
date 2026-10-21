@@ -47,7 +47,8 @@ pub mod visualize;
 pub use output::{DeepImage, DeepSamples, DisplaySpace, OutputDepth, OutputSpace, OutputTrc, Proof, ProofLut, proof_profile, register_proof_profile};
 pub use visualize::{MaskView, Overlay};
 
-use lightcraft_develop::{DevelopSettings, Treatment};
+use lightcraft_develop::{DevelopSettings, MaskShape, Treatment};
+use lightcraft_geom::Point;
 use std::any::Any;
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex};
@@ -398,6 +399,16 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         Cow::Owned(o) => Cow::Owned(upright::resolve(src, info, &o).into_owned()),
     };
     visualize::adjust_settings(req.overlay, &mut settings);
+    // ranked luminance ranges select by rank in the whole photo: give them its table
+    let ranked = |sh: &MaskShape| matches!(sh, MaskShape::LuminanceRange { ranked: true, .. });
+    if settings.masks.iter().any(|m| m.components.iter().any(|c| ranked(&c.shape))) {
+        let table = luminance_ranks(src, info, &settings);
+        for c in settings.to_mut().masks.iter_mut().flat_map(|m| m.components.iter_mut()) {
+            if let MaskShape::LuminanceRange { ranked: true, ranks, .. } = &mut c.shape {
+                *ranks = Some(table.clone());
+            }
+        }
+    }
     // a window must not choose a spot's source from the pixels it happens to hold: fix them
     // from a fixed-size render of the whole frame first
     if req.window.is_some() && settings.spots.iter().any(|sp| sp.source_offset.is_none()) {
@@ -456,6 +467,33 @@ pub fn plan<'a>(src: &Rgb32f, info: &SourceInfo, s: &'a DevelopSettings, req: &R
         detail_scale.to_bits(),
     ));
     Plan { settings, frame, w, h, px_per_long, src_long, detail_scale, geo, lin_key, pre_nr_key, eyes, fixed_air, keep, mattes: info.mattes.clone() }
+}
+
+/// The last few [`luminance_ranks`] tables, by source and white balance.
+static RANK_TABLES: Mutex<Vec<(u64, Arc<Vec<f32>>)>> = Mutex::new(Vec::new());
+
+/// The table ranked luminance ranges select with ([`masks::luminance_ranks`]): from a small copy
+/// of the whole of `src`, white-balanced for `s` (the scene-linear stage's luminance, before
+/// exposure). Kept for the last few sources.
+pub fn luminance_ranks(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings) -> Arc<Vec<f32>> {
+    let (t, tint) = local::effective_wb(info, s);
+    // a source is known by its size and a scatter of its pixels
+    let n = src.data.len();
+    let probe: Vec<u32> = (0..64).filter_map(|i| src.data.get(i * n / 64)).flat_map(|c| c.map(f32::to_bits)).collect();
+    let key = hash_of((src.width, src.height, probe, [t, tint, info.as_shot_temp, info.as_shot_tint].map(f64::to_bits), info.raw, info.relative_wb));
+    if let Some(hit) = RANK_TABLES.lock().ok().and_then(|c| c.iter().find(|(k, _)| *k == key).map(|(_, t)| t.clone())) {
+        return hit;
+    }
+    let mut small = masks::rank_copy(src);
+    local::white_balance(&mut small, info, s);
+    let table = Arc::new(masks::luminance_ranks(&small));
+    if let Ok(mut c) = RANK_TABLES.lock() {
+        c.retain(|(k, _)| *k != key);
+        c.push((key, table.clone()));
+        let extra = c.len().saturating_sub(4);
+        c.drain(..extra);
+    }
+    table
 }
 
 /// Whether the scene-linear stage needs work only the CPU does (defringe, spot removal).
@@ -630,10 +668,10 @@ fn render_impl(src: Src<'_>, info: &SourceInfo, s: &DevelopSettings, req: &Rende
     Rendered { image, histogram, deep: None }
 }
 
-/// The colour a colour-range mask would sample at normalized image point `p` (OkLab of the
-/// exposed scene colours, as [`MaskShape::ColorRange`](lightcraft_develop::MaskShape) compares
-/// them), averaged over 3 × 3 pixels of a render fitting `req`. `None` outside the image.
-pub fn color_range_sample(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest, p: lightcraft_geom::Point) -> Option<[f64; 3]> {
+/// The exposed scene colours a range mask's picker takes at normalized image point `a` (3 × 3
+/// pixels round it) or over the area with corners `a` and `b`, from a render fitting `req`. `None`
+/// when the point (or the whole area) is outside the image.
+fn picked_colours(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest, a: Point, b: Option<Point>) -> Option<Vec<[f32; 3]>> {
     // Pick from the same settings as the render: disabled panels contribute nothing, and an
     // SDR preview of an HDR edit includes the SDR rendition's exposure offset.
     let effective = s.effective();
@@ -641,25 +679,105 @@ pub fn color_range_sample(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, 
     let plan = plan(src, info, &rendition, req);
     let mut img = plan.frame.sample(src, plan.w, plan.h);
     lin_cpu(&mut img, info, &plan);
-    let o = plan.frame.norm_to_out(plan.w, plan.h).apply(p);
-    let (cx, cy) = (o.x.floor() as i64, o.y.floor() as i64);
-    if cx < 0 || cy < 0 || cx >= plan.w as i64 || cy >= plan.h as i64 {
+    let to_out = plan.frame.norm_to_out(plan.w, plan.h);
+    let (pa, pb) = (to_out.apply(a), to_out.apply(b.unwrap_or(a)));
+    let (w, h) = (plan.w as i64, plan.h as i64);
+    let (x0, y0) = (pa.x.min(pb.x).floor() as i64, pa.y.min(pb.y).floor() as i64);
+    let (x1, y1) = (pa.x.max(pb.x).floor() as i64, pa.y.max(pb.y).floor() as i64);
+    if b.is_none() && (x0 < 0 || y0 < 0 || x0 >= w || y0 >= h) {
+        return None;
+    }
+    // a point: the 3 × 3 pixels round it
+    let grow = i64::from(b.is_none());
+    let (x0, y0, x1, y1) = ((x0 - grow).max(0), (y0 - grow).max(0), (x1 + grow).min(w - 1), (y1 + grow).min(h - 1));
+    if x0 > x1 || y0 > y1 {
         return None;
     }
     let gain = (plan.settings.light.exposure as f32).exp2();
+    Some((y0..=y1).flat_map(|y| (x0..=x1).map(move |x| (x, y))).map(|(x, y)| img.data[y as usize * plan.w + x as usize].map(|v| v * gain)).collect())
+}
+
+/// The value `q` (0..1) of the way through sorted `v`.
+fn quantile(v: &mut [f64], q: f64) -> f64 {
+    v.sort_by(f64::total_cmp);
+    let i = ((v.len().saturating_sub(1)) as f64 * q).round() as usize;
+    v.get(i).copied().unwrap_or_default()
+}
+
+/// OkLab of an exposed scene colour as a colour range compares it: toned down
+/// ([`masks::tonemap_for_select`]) unless it selects `hue_first`.
+fn range_lab(c: [f32; 3], hue_first: bool) -> [f32; 3] {
+    lightcraft_color::perceptual::oklab_from_2020(if hue_first { c } else { masks::tonemap_for_select(c) })
+}
+
+/// The colour a colour-range mask would sample at normalized image point `p` (OkLab of the
+/// exposed scene colours, as [`MaskShape::ColorRange`](lightcraft_develop::MaskShape) compares
+/// them, `hue_first` or not), averaged over 3 × 3 pixels of a render fitting `req`. `None`
+/// outside the image.
+pub fn color_range_sample(src: &Rgb32f, info: &SourceInfo, s: &DevelopSettings, req: &RenderRequest, p: Point, hue_first: bool) -> Option<[f64; 3]> {
+    let px = picked_colours(src, info, s, req, p, None)?;
     let mut acc = [0f64; 3];
-    let mut n = 0.0;
-    for y in (cy - 1).max(0)..=(cy + 1).min(plan.h as i64 - 1) {
-        for x in (cx - 1).max(0)..=(cx + 1).min(plan.w as i64 - 1) {
-            let c = img.data[y as usize * plan.w + x as usize].map(|v| v * gain);
-            let lab = lightcraft_color::perceptual::oklab_from_2020(masks::tonemap_for_select(c));
-            for k in 0..3 {
-                acc[k] += lab[k] as f64;
-            }
-            n += 1.0;
+    for c in &px {
+        let lab = range_lab(*c, hue_first);
+        for k in 0..3 {
+            acc[k] += lab[k] as f64;
         }
     }
-    Some(acc.map(|v| v / n))
+    Some(acc.map(|v| v / px.len() as f64))
+}
+
+/// The colours a colour-range mask takes from the area with normalized corners `a` and `b`: the
+/// OkLab box they span (each of L, a, b from its 5th to its 95th percentile, so a stray pixel
+/// doesn't widen it). `None` when the area is outside the image.
+pub fn color_range_area(
+    src: &Rgb32f,
+    info: &SourceInfo,
+    s: &DevelopSettings,
+    req: &RenderRequest,
+    a: Point,
+    b: Point,
+    hue_first: bool,
+) -> Option<[[f64; 3]; 2]> {
+    let px = picked_colours(src, info, s, req, a, Some(b))?;
+    let labs: Vec<[f32; 3]> = px.iter().map(|c| range_lab(*c, hue_first)).collect();
+    let mut lo = [0f64; 3];
+    let mut hi = [0f64; 3];
+    for k in 0..3 {
+        let mut v: Vec<f64> = labs.iter().map(|l| f64::from(l[k])).collect();
+        lo[k] = quantile(&mut v, 0.05);
+        hi[k] = quantile(&mut v, 0.95);
+    }
+    Some([lo, hi])
+}
+
+/// The lightness (0..1, as [`masks::lightness_from_range`] shows a luminance range) a luminance
+/// range mask's picker takes at normalized point `a` (3 × 3 pixels averaged), or over the area
+/// with corners `a` and `b` (its darkest and lightest: the 5th and 95th percentiles). `ranked`:
+/// ranks in the photo instead ([`luminance_ranks`]).
+pub fn luminance_sample(
+    src: &Rgb32f,
+    info: &SourceInfo,
+    s: &DevelopSettings,
+    req: &RenderRequest,
+    a: Point,
+    b: Option<Point>,
+    ranked: bool,
+) -> Option<(f64, Option<f64>)> {
+    let px = picked_colours(src, info, s, req, a, b)?;
+    let table = ranked.then(|| luminance_ranks(src, info, s));
+    // (the picked colours are exposed; ranks are taken before exposure)
+    let ev = s.light.exposure as f32;
+    let mut l: Vec<f64> = px
+        .iter()
+        .map(|c| match &table {
+            Some(t) => f64::from(masks::rank_of(t, local::log_lum(*c) - ev)),
+            None => masks::lightness_from_range(f64::from((local::log_lum(*c) + 8.0) / 12.0)),
+        })
+        .collect();
+    if b.is_none() {
+        return Some((l.iter().sum::<f64>() / l.len() as f64, None));
+    }
+    Some((quantile(&mut l, 0.05), Some(quantile(&mut l, 0.95))))
 }
 
 /// The alpha plane a mask overlay shows: the one the render evaluated, or (for a hidden mask) a

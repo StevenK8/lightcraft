@@ -900,6 +900,11 @@ pub struct BrushStroke {
     pub density: f64,
     pub erase: bool,
     pub auto_mask: bool,
+    /// Painted as the reference's brush: feather spreads the edge out past the radius as well as
+    /// in, and flow sets how far a stroke builds up (`masks::brush_dabs`). Older strokes keep the
+    /// edge inside the radius and flow per dab.
+    #[serde(skip_serializing_if = "is_false")]
+    pub spread: bool,
     /// Pen pressure (0..1) at each of `points`, recorded when the brush's pressure switch is on: it scales each dab's
     /// radius and flow. Empty (the default, a mouse or the switch off) is full pressure everywhere; a point past the
     /// end of a shorter list takes the last value.
@@ -917,7 +922,17 @@ impl BrushStroke {
 
 impl Default for BrushStroke {
     fn default() -> Self {
-        Self { points: Vec::new(), size: 0.03, feather: 50.0, flow: 100.0, density: 100.0, erase: false, auto_mask: false, pressure: Vec::new() }
+        Self {
+            points: Vec::new(),
+            size: 0.03,
+            feather: 50.0,
+            flow: 100.0,
+            density: 100.0,
+            erase: false,
+            auto_mask: false,
+            spread: false,
+            pressure: Vec::new(),
+        }
     }
 }
 
@@ -941,10 +956,20 @@ pub enum MaskShape {
         feather: f64,
         invert: bool,
     },
-    /// Colour range: sampled OkLab colours with a refine amount 0..100.
+    /// Colour range: sampled OkLab colours with a refine amount 0..100; or an area's colours,
+    /// `area` the OkLab box they span (its low and high corners).
     ColorRange {
         samples: Vec<[f64; 3]>,
         refine: f64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        area: Option<[[f64; 3]; 2]>,
+        /// Where the picker took them: a point, or an area's two corners (normalized coords).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        picked: Vec<Point>,
+        /// Selects by hue and chroma first, lightness counting far less (less again for a colourful
+        /// sample), its samples OkLab of the exposed scene colour as it is (not toned down).
+        #[serde(default, skip_serializing_if = "is_false")]
+        hue_first: bool,
     },
     /// Luminance range (0..1 bounds with feathered falloff 0..1).
     LuminanceRange {
@@ -952,6 +977,17 @@ pub enum MaskShape {
         hi: f64,
         lo_feather: f64,
         hi_feather: f64,
+        /// Where the picker took it, as for `ColorRange`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        picked: Vec<Point>,
+        /// The bounds are ranks in the photo's own luminance (a pixel's rank: the share of the
+        /// photo darker than it) instead of log luminance (−8..+4 EV).
+        #[serde(default, skip_serializing_if = "is_false")]
+        ranked: bool,
+        /// For `ranked`: the photo's log₂ luminance (over middle grey) at ranks 0, 1/64, … 1,
+        /// filled in when a render is planned (never saved).
+        #[serde(skip)]
+        ranks: Option<std::sync::Arc<Vec<f32>>>,
     },
     DepthRange {
         lo: f64,
@@ -1008,6 +1044,9 @@ pub struct MaskComponent {
     pub op: MaskOp,
     #[serde(default)]
     pub invert: bool,
+    /// Hidden in the Masking panel (Hide): left out of the mask.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hidden: bool,
     pub shape: MaskShape,
 }
 
@@ -1027,6 +1066,10 @@ pub struct Mask {
 
 fn is_zero(v: &f64) -> bool {
     *v == 0.0
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 impl Default for Mask {

@@ -1336,8 +1336,13 @@ impl crate::Session {
     pub fn variant_job(&mut self, id: PhotoId, settings: &DevelopSettings, edge: usize) -> Option<RenderJob> {
         let p = self.catalog.photo(id)?.clone();
         let edge = edge.clamp(16, SourceLevel::Thumb.max_edge());
-        let level = SourceLevel::Thumb;
-        let source = self.media.source_ref(&p, level);
+        // the photo as memory already has it (the editor's view decoded it) before a decode of its
+        // own: that decode is background work and would wait behind any other (a neighbour readied
+        // ahead), while the panel showing these variants waits
+        let (level, source) = [SourceLevel::Thumb, SourceLevel::Preview]
+            .into_iter()
+            .find_map(|l| self.media.get_source(id, l).map(|s| (l, SourceRef::Loaded(Box::new(s)))))
+            .unwrap_or_else(|| (SourceLevel::Thumb, self.media.source_ref(&p, SourceLevel::Thumb)));
         let ck = Self::variant_key(&p, settings, edge);
         Some(RenderJob {
             request_id: 0,
@@ -2349,6 +2354,13 @@ mod tests {
         assert_eq!(again.rendered.unwrap().image.as_bytes(), first.as_bytes());
         let other = jb.run().rendered.unwrap().image;
         assert_ne!(other.as_bytes(), first.as_bytes());
+        // with only the view's source in memory, a variant starts from it instead of decoding
+        s.media.clear_sources();
+        s.source_now(id, SourceLevel::Preview).unwrap();
+        let jc = s.variant_job(id, &with("lc.bw.soft"), 128).unwrap();
+        assert!(jc.level == SourceLevel::Preview && matches!(jc.source, SourceRef::Loaded(_)));
+        let c = jc.run().rendered.unwrap().image;
+        assert!(c.width.max(c.height) <= 128);
         // the photo's own settings never changed
         assert_eq!(*s.develop_of(id).unwrap(), mine);
         // hover previews: a loupe-sized job with other settings, its own key

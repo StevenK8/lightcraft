@@ -232,6 +232,17 @@ pub struct Gpu {
     free: std::sync::Mutex<Vec<Tracked>>,
     /// Largest storage buffer the device accepts (bytes).
     pub max_buffer: u64,
+    /// Most pixels an image may have on this device, the render's or its source's
+    /// ([`max_pixels`]); larger ones are done on the CPU.
+    pub max_pixels: usize,
+}
+
+/// Most pixels a render (its output, or a source it samples) may have on the GPU. On Android,
+/// fewer than 2^24: on an Adreno 830 (Vulkan) every pixel from index 2^24 on landed back at the
+/// start of the image, so a 24 MP export came back with its last rows written over its first
+/// and the rest black, while all smaller indices were right. CPU renders are exact at any size.
+pub(crate) fn max_pixels(_info: &wgpu::AdapterInfo) -> usize {
+    if cfg!(target_os = "android") { (1 << 24) - 1 } else { usize::MAX }
 }
 
 /// WGSL constants shared by every module (generated from the CPU pipeline's values).
@@ -368,7 +379,11 @@ impl Gpu {
         });
         let max_buffer = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
         log::info!("gpu: {} ({:?}), buffers ≤ {} MiB", info.name, info.backend, max_buffer >> 20);
-        Ok(Gpu { device, queue, info, kernels, dummy, free: Default::default(), max_buffer })
+        let max_pixels = max_pixels(&info);
+        if max_pixels != usize::MAX {
+            log::info!("gpu: images over {max_pixels} pixels render on the CPU");
+        }
+        Ok(Gpu { device, queue, info, kernels, dummy, free: Default::default(), max_buffer, max_pixels })
     }
 
     /// A buffer of `len` 32-bit values with undefined contents (a recycled one when possible).

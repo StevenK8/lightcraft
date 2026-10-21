@@ -22,7 +22,12 @@ fn noise(x: usize, y: usize, k: u32) -> f32 {
 fn left_mask(adjust: LocalAdjustments) -> DevelopSettings {
     let shape = MaskShape::Linear { start: Point::new(0.45, 0.5), end: Point::new(0.46, 0.5) };
     let mut s = DevelopSettings::default();
-    s.masks.push(Mask { id: 1, components: vec![MaskComponent { name: None, op: MaskOp::Add, invert: false, shape }], adjust, ..Default::default() });
+    s.masks.push(Mask {
+        id: 1,
+        components: vec![MaskComponent { hidden: false, name: None, op: MaskOp::Add, invert: false, shape }],
+        adjust,
+        ..Default::default()
+    });
     s
 }
 

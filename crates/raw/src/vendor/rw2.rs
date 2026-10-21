@@ -990,7 +990,7 @@ mod tests {
     fn packed_and_word_formats() {
         let (w, h) = (90usize, 200usize); // > one chunk of data
         for (format, bits, rotated) in [(5u16, 12u32, true), (5, 14, true), (7, 14, false), (2, 12, false)] {
-            let px: Vec<u16> = (0..w * h).map(|i| (((i * 2654435761usize) >> 7) as u16 & ((1 << bits) - 1)).max(1)).collect();
+            let px: Vec<u16> = (0..w * h).map(|i| ((i.wrapping_mul(2654435761usize) >> 7) as u16 & ((1 << bits) - 1)).max(1)).collect();
             let stream = pack(&px, bits);
             let bytes = rw2(w as u16, h as u16, bits as u16, format, 100, &if rotated { rotate(stream) } else { stream });
             assert_eq!(crate::probe(&bytes), Some(RawFormat::Rw2));

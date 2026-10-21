@@ -29,6 +29,151 @@ fn full_size_export_of_a_cropped_photo_is_not_upscaled() {
     assert_eq!(u32::from_be_bytes(e.bytes[i + 4..i + 8].try_into().unwrap()), 9449, "240 ppi");
 }
 
+/// Given a border on an export, when the photo is exported, then the photo keeps its size and the
+/// file grows as the border's shape asks: an even margin of half the thickness (of the long edge),
+/// or the photo padded out to a ratio (its own, or a fixed one) and that frame grown by the
+/// thickness; its edges are the border's colour (8-bit and 16-bit), and an unreadable border is
+/// refused before exporting.
+#[test]
+fn a_border_frames_the_photo_without_changing_its_size() {
+    use crate::export::{Border, BorderRatio};
+    let mut s = Session::with_demo();
+    let id = s.active().unwrap();
+    let plain = ExportOptions::from_json(&json!({"longEdge": 400, "format": "jpeg"}));
+    let p = export_photo(&mut s, id, &plain, 1).unwrap();
+    let (w, h) = (p.width, p.height);
+    // even: 10 % of the long edge split over the two sides
+    let o =
+        ExportOptions::from_json(&json!({"longEdge": 400, "format": "jpeg", "border": {"thickness": 10, "ratio": "even", "color": [200, 10, 30]}}));
+    let b = export_photo(&mut s, id, &o, 1).unwrap();
+    assert_eq!((b.width, b.height), (w + 40, h + 40));
+    assert_eq!(crate::export::output_size(s.catalog.photo(id).unwrap(), &o), crate::export::output_size(s.catalog.photo(id).unwrap(), &plain));
+    let rgb = lightcraft_codecs::decode(&b.bytes, Default::default()).unwrap().to_srgb8();
+    assert_eq!((rgb.width, rgb.height), (b.width, b.height));
+    for at in [0, rgb.width - 1, rgb.width * (rgb.height - 1)] {
+        let px = rgb.data[at];
+        assert!(px[0].abs_diff(200) <= 6 && px[1].abs_diff(10) <= 6 && px[2].abs_diff(30) <= 6, "{px:?}");
+    }
+    // the photo's own shape grown by the thickness, and a square frame around a wide photo
+    let own = Border { thickness: 10.0, ratio: BorderRatio::Original, color: [255; 3] };
+    let (fw, fh) = own.framed(400, 300);
+    assert_eq!((fw, fh), (440, 330));
+    let square = Border { thickness: 0.0, ratio: BorderRatio::R1x1, color: [255; 3] };
+    assert_eq!(square.margins(400, 300), [0, 0, 50, 50]);
+    assert_eq!(Border { thickness: 10.0, ..square }.framed(400, 300), (440, 440));
+    assert_eq!(Border { ratio: BorderRatio::R9x16, thickness: 0.0, ..square }.framed(900, 900).1 * 9, 900 * 16);
+    // 16 bits a channel: the same frame
+    let deep = ExportOptions::from_json(&json!({"longEdge": 400, "format": "tiff", "bitDepth": 16, "border": {"thickness": 10, "ratio": "even"}}));
+    let t = export_photo(&mut s, id, &deep, 1).unwrap();
+    assert_eq!((t.width, t.height), (w + 40, h + 40));
+    let corner = lightcraft_codecs::decode(&t.bytes, Default::default()).unwrap().to_srgb8().data[0];
+    assert_eq!(corner, [255, 255, 255, 255]);
+    // nothing to draw, no border; out of range or unknown keys are refused
+    assert!(ExportOptions::from_json(&json!({"border": {"thickness": 0, "ratio": "even"}})).border.is_none());
+    for bad in [
+        json!({"border": {"thickness": 150}}),
+        json!({"border": {"ratio": "7:3"}}),
+        json!({"border": {"color": [1, 2]}}),
+        json!({"border": {"size": 3}}),
+        json!({"border": 3}),
+    ] {
+        assert!(ExportOptions::from_params(&bad).is_err(), "{bad}");
+    }
+    assert!(ExportOptions::from_params(&json!({"border": {"thickness": 10, "ratio": "4:5", "color": [0, 0, 0]}})).is_ok());
+}
+
+/// Given a watermark with the reference's options, when it's drawn, then its offsets set its
+/// margins from the edges (fractions of width and height), a quarter turn stands it on its side,
+/// bold and italic change the letters, and the options are checked before exporting.
+#[test]
+fn watermark_offsets_turns_and_styles() {
+    use crate::export::{Anchor, Watermark, draw_watermark};
+    use lightcraft_raster::Rgba8;
+    // the bounding box of what was drawn on black
+    let drawn = |wm: &Watermark| {
+        let mut img = Rgba8::new(400, 300);
+        for p in img.data.iter_mut() {
+            *p = [0, 0, 0, 255];
+        }
+        draw_watermark(&mut img, wm);
+        let mut b = (usize::MAX, usize::MAX, 0usize, 0usize);
+        for (i, p) in img.data.iter().enumerate() {
+            if p[0] > 128 {
+                let (x, y) = (i % 400, i / 400);
+                b = (b.0.min(x), b.1.min(y), b.2.max(x), b.3.max(y));
+            }
+        }
+        (b, img)
+    };
+    let base = Watermark { text: "LightCraft".into(), size: 0.1, opacity: 1.0, shadow: false, anchor: Anchor::BottomLeft, ..Default::default() };
+    let at = Watermark { offset_x: Some(0.1), offset_y: Some(0.2), ..base.clone() };
+    let ((x0, _, _, y1), _) = drawn(&at);
+    assert!(x0.abs_diff(40) <= 4, "10 % of the width from the left: {x0}");
+    assert!((300 - y1).abs_diff(60) <= 10, "20 % of the height from the bottom: {y1}");
+    // a quarter turn: taller than wide
+    let ((x0, y0, x1, y1), _) = drawn(&Watermark { rotation: 90, ..base.clone() });
+    assert!(y1 - y0 > 2 * (x1 - x0), "standing on its side: {}×{}", x1 - x0, y1 - y0);
+    let ((x0, y0, x1, y1), _) = drawn(&Watermark { rotation: 180, ..base.clone() });
+    assert!(x1 - x0 > 2 * (y1 - y0), "upside down stays wide");
+    // regular and bold draw differently; italic leans (wider)
+    let (_, regular) = drawn(&Watermark { bold: false, ..base.clone() });
+    let (_, bold) = drawn(&base);
+    assert_ne!(regular.data, bold.data);
+    let ((a0, _, a1, _), _) = drawn(&base);
+    let ((b0, _, b1, _), _) = drawn(&Watermark { italic: true, ..base.clone() });
+    assert!(b1 - b0 > a1 - a0, "italic leans: {} vs {}", b1 - b0, a1 - a0);
+    // checks
+    for bad in [json!({"watermark": {"rotation": 45}}), json!({"watermark": {"offsetX": 2}}), json!({"watermark": {"bold": "yes"}})] {
+        assert!(ExportOptions::from_params(&bad).is_err(), "{bad}");
+    }
+    assert!(
+        ExportOptions::from_params(
+            &json!({"watermark": {"text": "a", "bold": false, "italic": true, "offsetX": 0.03, "offsetY": 0.03, "rotation": 270}})
+        )
+        .is_ok()
+    );
+}
+
+/// A long edge of 2048 px is 2048 px, also when the crop is a hair off the box's aspect (the
+/// render's own fit used to round it to 2047).
+#[test]
+fn a_long_edge_export_has_exactly_that_long_edge() {
+    let mut s = Session::with_demo();
+    let id = s.active().unwrap();
+    let wide = {
+        let p = s.catalog.photo(id).unwrap();
+        p.width >= p.height
+    };
+    // the long side cropped by a hair: its aspect is just off the output's rounded one
+    let rect = if wide { [0.0, 0.0, 0.99995, 1.0] } else { [0.0, 0.0, 1.0, 0.99995] };
+    s.execute("crop.set", &json!({"rect": rect})).unwrap();
+    for edge in [2048, 1080, 4000] {
+        let o = ExportOptions::from_json(&json!({"longEdge": edge}));
+        let e = export_photo(&mut s, id, &o, 1).unwrap();
+        assert_eq!(e.width.max(e.height), edge, "{}×{} for a {edge} px long edge", e.width, e.height);
+        // the short side as the size preview says, to the pixel (it follows the decoded source's aspect)
+        let (pw, ph) = crate::export::output_size(s.catalog.photo(id).unwrap(), &o);
+        assert!(e.width.min(e.height).abs_diff(pw.min(ph)) <= 1, "{}×{} vs {pw}×{ph}", e.width, e.height);
+    }
+    // a square crop: the long edge doesn't grow a pixel on the other side
+    s.execute("crop.set", &json!({"rect": [0.0, 0.0, 0.6666, 0.99995]})).unwrap();
+    let o = ExportOptions::from_json(&json!({"longEdge": 2048}));
+    let e = export_photo(&mut s, id, &o, 1).unwrap();
+    assert_eq!(e.width.max(e.height), 2048, "{}×{}", e.width, e.height);
+    s.execute("crop.set", &json!({"rect": rect})).unwrap();
+    // the short edge, width and height modes keep their side exact too
+    for (opts, side) in [(json!({"shortEdge": 1000}), "short"), (json!({"width": 1500}), "width"), (json!({"height": 1500}), "height")] {
+        let o = ExportOptions::from_json(&opts);
+        let e = export_photo(&mut s, id, &o, 1).unwrap();
+        let got = match side {
+            "short" => e.width.min(e.height),
+            "width" => e.width,
+            _ => e.height,
+        };
+        assert_eq!(got, if side == "short" { 1000 } else { 1500 }, "{side}: {}×{}", e.width, e.height);
+    }
+}
+
 #[test]
 fn original_export_copies_the_file_and_writes_its_edits_beside_it() {
     let dir = temp_dir("export-orig");

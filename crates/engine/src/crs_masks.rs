@@ -114,11 +114,10 @@ fn unmapped_local(c: &XmpValue) -> Vec<String> {
         .collect()
 }
 
-/// Perceptual lightness 0..1 (how range masks store luminance) → our range scale: log
-/// luminance on −8..+4 EV mapped to 0..1.
+/// Perceptual lightness 0..1 (how range masks store luminance) → our range scale (log luminance
+/// round middle grey), as the luminance picker maps it.
 fn lightness_to_range(l: f64) -> f64 {
-    let y = l.clamp(1e-4, 1.0).powf(2.2);
-    ((y.log2() + 8.0) / 12.0).clamp(0.0, 1.0)
+    lightcraft_pipeline::masks::range_from_lightness(l)
 }
 
 fn pt(x: f64, y: f64) -> Value {

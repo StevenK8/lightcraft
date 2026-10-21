@@ -144,6 +144,9 @@ pub enum Fault {
     DropWork,
     /// A storage-buffer limit of this many bytes for this render.
     Limit(u64),
+    /// At most this many pixels for this render's images (as a device with a pixel cap, see
+    /// `Gpu::max_pixels`).
+    Pixels(usize),
 }
 
 thread_local! {

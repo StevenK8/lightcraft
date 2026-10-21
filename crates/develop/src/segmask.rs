@@ -158,6 +158,7 @@ mod tests {
         d.masks.push(crate::Mask {
             id: 1,
             components: vec![crate::MaskComponent {
+                hidden: false,
                 name: None,
                 op: crate::MaskOp::Add,
                 invert: false,

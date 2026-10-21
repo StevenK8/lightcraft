@@ -13,6 +13,7 @@ mod cull;
 pub mod curves;
 pub(crate) mod denoise;
 mod develop;
+pub use develop::{ResetTo, reset_settings};
 mod edit;
 mod export;
 pub(crate) mod face_detect;

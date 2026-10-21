@@ -182,6 +182,7 @@ mod tests {
         s.masks.push(Mask {
             id: 1,
             components: vec![MaskComponent {
+                hidden: false,
                 name: None,
                 op: MaskOp::Add,
                 invert: false,

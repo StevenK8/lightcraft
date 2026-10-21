@@ -106,6 +106,7 @@ fn mask_brightens_only_inside() {
     let mut s = DevelopSettings::default();
     s.masks.push(Mask {
         components: vec![MaskComponent {
+            hidden: false,
             name: None,
             op: MaskOp::Add,
             invert: false,
@@ -279,7 +280,7 @@ fn color_range_sampling_respects_disabled_sections() {
     let info = SourceInfo::default();
     let req = RenderRequest::fit(32, 24);
     let point = lightcraft_geom::Point::new(0.5, 0.5);
-    let plain = color_range_sample(&src, &info, &DevelopSettings::default(), &req, point).unwrap();
+    let plain = color_range_sample(&src, &info, &DevelopSettings::default(), &req, point, false).unwrap();
     for section in ["light", "color"] {
         let mut s = DevelopSettings::default();
         if section == "light" {
@@ -289,17 +290,24 @@ fn color_range_sampling_respects_disabled_sections() {
             s.wb.temp = 12000.0;
             s.wb.tint = 100.0;
         }
-        assert_ne!(color_range_sample(&src, &info, &s, &req, point).unwrap(), plain, "enabled {section}");
+        assert_ne!(color_range_sample(&src, &info, &s, &req, point, false).unwrap(), plain, "enabled {section}");
         s.set_section_enabled(section, false);
-        let sample = color_range_sample(&src, &info, &s, &req, point).unwrap();
+        let sample = color_range_sample(&src, &info, &s, &req, point, false).unwrap();
         assert_eq!(sample, plain, "disabled {section} must not change the picked colour");
         s.masks.push(lightcraft_develop::Mask {
             id: 1,
             components: vec![lightcraft_develop::MaskComponent {
+                hidden: false,
                 name: None,
                 op: lightcraft_develop::MaskOp::Add,
                 invert: false,
-                shape: lightcraft_develop::MaskShape::ColorRange { samples: vec![sample], refine: 0.0 },
+                shape: lightcraft_develop::MaskShape::ColorRange {
+                    samples: vec![sample],
+                    refine: 0.0,
+                    area: None,
+                    picked: Vec::new(),
+                    hue_first: false,
+                },
             }],
             ..Default::default()
         });
@@ -319,11 +327,11 @@ fn color_range_sampling_uses_the_requested_hdr_rendition() {
     s.hdr.enabled = true;
     s.hdr.sdr_brightness = 100.0;
     let req = RenderRequest::fit(32, 24);
-    let expected = color_range_sample(&src, &info, &s.sdr_rendition(), &req, point).unwrap();
-    assert_eq!(color_range_sample(&src, &info, &s, &req, point).unwrap(), expected, "SDR preview brightness affects the picked colour");
+    let expected = color_range_sample(&src, &info, &s.sdr_rendition(), &req, point, false).unwrap();
+    assert_eq!(color_range_sample(&src, &info, &s, &req, point, false).unwrap(), expected, "SDR preview brightness affects the picked colour");
     let hdr = RenderRequest { depth: OutputDepth::F32Hdr, ..req };
-    let plain = color_range_sample(&src, &info, &DevelopSettings::default(), &hdr, point).unwrap();
-    assert_eq!(color_range_sample(&src, &info, &s, &hdr, point).unwrap(), plain, "HDR does not use the SDR offset");
+    let plain = color_range_sample(&src, &info, &DevelopSettings::default(), &hdr, point, false).unwrap();
+    assert_eq!(color_range_sample(&src, &info, &s, &hdr, point, false).unwrap(), plain, "HDR does not use the SDR offset");
     assert_ne!(plain, expected);
 }
 

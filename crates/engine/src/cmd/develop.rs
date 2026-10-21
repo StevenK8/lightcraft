@@ -21,6 +21,58 @@ fn edit(s: &mut Session, c: &str, label: &str, f: impl FnOnce(&mut DevelopSettin
     ok()
 }
 
+/// What Reset returns a photo to (`develop.reset`'s `to`), as the phone app's Reset choices name them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResetTo {
+    /// The photo as imported: its import look (a default preset's) or else LightCraft's defaults.
+    Import,
+    /// LightCraft's defaults, the white balance as shot, whatever look it was imported with.
+    Default,
+    /// The defaults, keeping its crop, orientation and geometry.
+    Adjustments,
+}
+
+impl ResetTo {
+    /// `import`, `default` (or `all`) and `adjustments`.
+    pub fn parse(s: &str) -> Option<ResetTo> {
+        match s {
+            "import" => Some(ResetTo::Import),
+            "default" | "all" => Some(ResetTo::Default),
+            "adjustments" => Some(ResetTo::Adjustments),
+            _ => None,
+        }
+    }
+}
+
+/// Photo `id`'s settings once reset `to` (from its `current` ones).
+pub fn reset_settings(s: &Session, id: PhotoId, current: &DevelopSettings, to: ResetTo) -> DevelopSettings {
+    let look = if to == ResetTo::Import { s.catalog.photo(id).and_then(|p| p.import_look.clone()) } else { None };
+    let fresh = match look {
+        Some(l) => (*l).clone(),
+        None => {
+            // the photo's built-in defaults (raws: capture sharpening and colour noise
+            // reduction, embedded lens corrections), as at import, with the white balance
+            // of its current as-shot reference
+            let info = s.source_info(id);
+            let defaults = s.catalog.photo(id).map(|p| p.camera_defaults()).unwrap_or_default();
+            let mut fresh = DevelopSettings {
+                wb: lightcraft_develop::WhiteBalance { mode: WbMode::AsShot, temp: info.as_shot_temp, tint: info.as_shot_tint, ..Default::default() },
+                ..defaults
+            };
+            lightcraft_pipeline::local::normalize_wb(&mut fresh, &info);
+            fresh
+        }
+    };
+    // a fresh start renders with the current process (a section or slider reset doesn't change it)
+    let fresh = DevelopSettings { process: ProcessVersion::LATEST, ..fresh };
+    if to == ResetTo::Adjustments {
+        let keep = lightcraft_develop::extract_groups(current, &[SettingsGroup::Crop, SettingsGroup::Geometry]);
+        lightcraft_develop::apply_partial(&fresh, &keep, 1.0)
+    } else {
+        fresh
+    }
+}
+
 fn section_param(p: &Value, c: &str) -> Result<Section> {
     let v = p.get("section").cloned().ok_or_else(|| bad(c, "missing `section`"))?;
     serde_json::from_value(v).map_err(|e| bad(c, e.to_string()))
@@ -262,42 +314,28 @@ pub fn specs() -> Vec<CommandSpec> {
                 Ok(())
             })
         }),
-        cmd!("develop.reset", "Reset Edits", ["Photo"], Some("Cmd+Shift+R"), "{ids?}", has_selection, |s, p| {
-            let ids = s.targets(p)?;
-            let ops = ids
-                .iter()
-                .filter_map(|id| s.develop_of(*id).map(|d| (*id, d)))
-                .filter_map(|(id, _d)| {
-                    // back to the photo's import defaults when a default preset gave it its look
-                    let look = s.catalog.photo(id).and_then(|p| p.import_look.clone());
-                    let fresh = match look {
-                        Some(l) => (*l).clone(),
-                        None => {
-                            // the photo's built-in defaults (raws: capture sharpening and colour noise
-                            // reduction, embedded lens corrections), as at import, with the white balance
-                            // of its current as-shot reference
-                            let info = s.source_info(id);
-                            let defaults = s.catalog.photo(id).map(|p| p.camera_defaults()).unwrap_or_default();
-                            let mut fresh = DevelopSettings {
-                                wb: lightcraft_develop::WhiteBalance {
-                                    mode: WbMode::AsShot,
-                                    temp: info.as_shot_temp,
-                                    tint: info.as_shot_tint,
-                                    ..Default::default()
-                                },
-                                ..defaults
-                            };
-                            lightcraft_pipeline::local::normalize_wb(&mut fresh, &info);
-                            fresh
-                        }
-                    };
-                    // a fresh start renders with the current process (a section or slider reset doesn't change it)
-                    s.develop_op(id, DevelopSettings { process: ProcessVersion::LATEST, ..fresh }, "Reset")
-                })
-                .collect();
-            s.commit("Reset", Op::Batch { ops })?;
-            ok()
-        }),
+        cmd!(
+            "develop.reset",
+            "Reset Edits",
+            ["Photo"],
+            Some("Cmd+Shift+R"),
+            "{ids?, to?: import (default: the photo as imported, its import look if a default preset gave it one) | default (LightCraft's defaults) | adjustments (the defaults, keeping crop, orientation and geometry)}",
+            has_selection,
+            |s, p| {
+                let to = match str_param(p, "to") {
+                    Some(t) => ResetTo::parse(t).ok_or_else(|| bad("develop.reset", format!("to `{t}`: import, default or adjustments")))?,
+                    None => ResetTo::Import,
+                };
+                let ids = s.targets(p)?;
+                let ops = ids
+                    .iter()
+                    .filter_map(|id| s.develop_of(*id).map(|d| (*id, d)))
+                    .filter_map(|(id, d)| s.develop_op(id, reset_settings(s, id, &d, to), "Reset"))
+                    .collect();
+                s.commit("Reset", Op::Batch { ops })?;
+                ok()
+            }
+        ),
         CommandSpec {
             explicit_targets: true,
             ..cmd!(
@@ -422,6 +460,8 @@ pub fn specs() -> Vec<CommandSpec> {
                         let src = s.source_now(id, SourceLevel::Thumb).map_err(|e| bad("develop.wb", e))?;
                         lightcraft_pipeline::auto::auto_wb(&src, &info)
                     }
+                    // Custom picked from the list: the white balance in effect now, under its own name
+                    WbMode::Custom => lightcraft_pipeline::local::effective_wb(&info, &s.develop_of(id).unwrap_or_default()),
                     m => m
                         .preset()
                         .map(|(t, ti)| {

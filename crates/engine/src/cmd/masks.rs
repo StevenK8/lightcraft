@@ -30,6 +30,9 @@ fn shape_from(kind: &str, p: &Value, c: &str) -> Result<MaskShape> {
             hi: f64_or(p, "hi", 1.0),
             lo_feather: f64_or(p, "loFeather", 0.1),
             hi_feather: f64_or(p, "hiFeather", 0.1),
+            picked: vec![],
+            ranked: bool_or(p, "ranked", false),
+            ranks: None,
         },
         "colorRange" => {
             let samples: Vec<[f64; 3]> = p
@@ -37,7 +40,7 @@ fn shape_from(kind: &str, p: &Value, c: &str) -> Result<MaskShape> {
                 .and_then(Value::as_array)
                 .map(|a| a.iter().filter_map(|s| Some([s.get(0)?.as_f64()?, s.get(1)?.as_f64()?, s.get(2)?.as_f64()?])).collect())
                 .unwrap_or_default();
-            MaskShape::ColorRange { samples, refine: f64_or(p, "refine", 50.0) }
+            MaskShape::ColorRange { samples, refine: f64_or(p, "refine", 50.0), area: None, picked: vec![], hue_first: bool_or(p, "hueFirst", false) }
         }
         "object" => MaskShape::Object { hint: points(p, "points"), exclude: points(p, "exclude"), seg: seg_param(p), detail: vec![], edge: 0.0 },
         "prompt" => {
@@ -50,6 +53,15 @@ fn shape_from(kind: &str, p: &Value, c: &str) -> Result<MaskShape> {
             ));
         }
     })
+}
+
+/// Where a range picker samples: point `x`, `y`, or the area with corners `x0`, `y0` and `x1`, `y1`.
+fn picked_points(p: &Value, c: &str) -> Result<(Point, Option<Point>)> {
+    if p.get("x0").is_some() {
+        let n = |k| super::f64_req(p, k, c);
+        return Ok((Point::new(n("x0")?, n("y0")?), Some(Point::new(n("x1")?, n("y1")?))));
+    }
+    Ok((Point::new(super::f64_req(p, "x", c)?, super::f64_req(p, "y", c)?), None))
 }
 
 /// `[[x, y], …]` normalized points under `key`.
@@ -234,7 +246,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Create New Mask",
             [],
             None,
-            "{kind: brush|linear|radial|sky|subject|background|luminanceRange|colorRange|object|prompt, ...shape params (start/end, center/rx/ry/angle/feather, lo/hi…; object: points/exclude [[x,y],…]; prompt: text; object/prompt: seg? a stored segmentation, no model needed), name?} — AI kinds need the SAM 3 model; in the app a prompt returns {pending} and the mask appears when found",
+            "{kind: brush|linear|radial|sky|subject|background|luminanceRange|colorRange|object|prompt, ...shape params (start/end, center/rx/ry/angle/feather, lo/hi…, ranked: luminance by rank in the photo; hueFirst: colour by hue and chroma first; object: points/exclude [[x,y],…]; prompt: text; object/prompt: seg? a stored segmentation, no model needed), name?} — AI kinds need the SAM 3 model; in the app a prompt returns {pending} and the mask appears when found",
             has_active,
             |s, p| {
                 let kind = str_param(p, "kind").unwrap_or("radial").to_string();
@@ -253,7 +265,7 @@ pub fn specs() -> Vec<CommandSpec> {
                     masks.push(Mask {
                         id: next,
                         name: name.unwrap_or_else(|| format!("Mask {next}")),
-                        components: vec![MaskComponent { name: None, op: MaskOp::Add, invert: false, shape }],
+                        components: vec![MaskComponent { hidden: false, name: None, op: MaskOp::Add, invert: false, shape }],
                         adjust,
                         ..Default::default()
                     });
@@ -290,7 +302,7 @@ pub fn specs() -> Vec<CommandSpec> {
                 let mut comp = 0;
                 let out = masks_edit(s, "mask.addComponent", "Edit Mask", |masks, _| {
                     let i = find(masks, mid, "mask.addComponent")?;
-                    masks[i].components.push(MaskComponent { name: None, op, invert: bool_or(p, "invert", false), shape });
+                    masks[i].components.push(MaskComponent { hidden: false, name: None, op, invert: bool_or(p, "invert", false), shape });
                     comp = masks[i].components.len() - 1;
                     Ok(())
                 })?;
@@ -302,7 +314,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Brush Stroke",
             [],
             None,
-            "{id?: maskId, points: [[x,y],…] normalized, size?: fraction of long edge (0.03), feather?, flow?, density?, erase?: bool, autoMask?: bool, pressure?: [p,…] pen pressure 0..1 per point (scales each dab's size and flow; omitted: full), connect?: bool — start from the last point of the mask's last stroke (⇧-click), size / feather / flow tapering from that stroke's to these} → {activeMask, connected}",
+            "{id?: maskId, points: [[x,y],…] normalized, size?: fraction of long edge (0.03), feather?, flow?, density?, erase?: bool, autoMask?: bool, spread?: bool (the reference's brush: feather spreads past the radius, flow builds up), pressure?: [p,…] pen pressure 0..1 per point (scales each dab's size and flow; omitted: full), connect?: bool — start from the last point of the mask's last stroke (⇧-click), size / feather / flow tapering from that stroke's to these} → {activeMask, connected}",
             has_active,
             |s, p| {
                 let pts: Vec<Point> = p
@@ -322,6 +334,7 @@ pub fn specs() -> Vec<CommandSpec> {
                     density: f64_or(p, "density", d.density),
                     erase: bool_or(p, "erase", false),
                     auto_mask: bool_or(p, "autoMask", false),
+                    spread: bool_or(p, "spread", false),
                     pressure: pressure_list(p.get("pressure"), pts_len)?,
                 };
                 let connect = bool_or(p, "connect", false);
@@ -339,7 +352,7 @@ pub fn specs() -> Vec<CommandSpec> {
                         }
                     };
                     let m = &mut masks[i];
-                    if let Some(MaskComponent { shape: MaskShape::Brush { strokes }, .. }) =
+                    if let Some(MaskComponent { hidden: false, shape: MaskShape::Brush { strokes }, .. }) =
                         m.components.iter_mut().rev().find(|c| matches!(c.shape, MaskShape::Brush { .. }))
                     {
                         // the previous stroke's end and its brush values (not its points)
@@ -366,6 +379,7 @@ pub fn specs() -> Vec<CommandSpec> {
                         }
                     } else {
                         m.components.push(MaskComponent {
+                            hidden: false,
                             name: None,
                             op: MaskOp::Add,
                             invert: false,
@@ -397,40 +411,104 @@ pub fn specs() -> Vec<CommandSpec> {
             "Sample Mask Color",
             [],
             None,
-            "{x, y: normalized image point, add?: bool (⇧: add to the samples, max 5), id?, component?} — the colour range of the selected mask (its first colour-range component) samples the colour there → {samples}",
+            "{x, y: normalized image point, add?: bool (⇧: add to the samples, max 5), id?, component?} or {x0, y0, x1, y1: an area's corners} — the colour range of the selected mask (its first colour-range component) samples the colour there, or takes the area's colours instead of its samples → {samples, area}",
             has_active,
             |s, p| {
                 let c = "mask.sampleColor";
                 let mid = mask_id(p, s.active_mask, c)?;
                 let comp = optional_index(p, "component", c)?;
-                let (x, y) = (super::f64_req(p, "x", c)?, super::f64_req(p, "y", c)?);
-                let add = p.get("add").and_then(Value::as_bool).unwrap_or(false);
+                let (a, b) = picked_points(p, c)?;
+                let add = b.is_none() && p.get("add").and_then(Value::as_bool).unwrap_or(false);
                 let id = s.active().ok_or_else(|| bad(c, "no active photo"))?;
                 let src = s.source_now(id, crate::media::SourceLevel::Thumb).map_err(|e| bad(c, e))?;
                 let info = s.source_info(id);
                 let d = s.develop_of(id).unwrap_or_default();
+                // a hue-first range keeps its colours as they are (not toned down)
+                let hue_first = d.masks.iter().find(|m| m.id == mid).is_some_and(|m| {
+                    let k = comp.or_else(|| m.components.iter().position(|x| matches!(x.shape, MaskShape::ColorRange { .. })));
+                    k.and_then(|k| m.components.get(k)).is_some_and(|x| matches!(x.shape, MaskShape::ColorRange { hue_first: true, .. }))
+                });
                 let req = lightcraft_pipeline::RenderRequest::fit(384, 384);
-                let lab = lightcraft_pipeline::color_range_sample(&src, &info, &d, &req, lightcraft_geom::Point::new(x, y))
-                    .ok_or_else(|| bad(c, "the point is outside the photo"))?;
-                let mut out = Vec::new();
+                let (lab, boxed) = match b {
+                    None => {
+                        let lab = lightcraft_pipeline::color_range_sample(&src, &info, &d, &req, a, hue_first)
+                            .ok_or_else(|| bad(c, "the point is outside the photo"))?;
+                        (Some(lab), None)
+                    }
+                    Some(b) => {
+                        let area = lightcraft_pipeline::color_range_area(&src, &info, &d, &req, a, b, hue_first)
+                            .ok_or_else(|| bad(c, "the area is outside the photo"))?;
+                        (None, Some(area))
+                    }
+                };
+                let mut out = json!({});
                 masks_edit(s, c, "Color Range", |masks, _| {
                     let i = find(masks, mid, c)?;
                     let k = comp
                         .or_else(|| masks[i].components.iter().position(|x| matches!(x.shape, MaskShape::ColorRange { .. })))
                         .ok_or_else(|| bad(c, "the mask has no colour range"))?;
-                    let Some(MaskShape::ColorRange { samples, .. }) = masks[i].components.get_mut(k).map(|x| &mut x.shape) else {
+                    let Some(MaskShape::ColorRange { samples, area, picked, .. }) = masks[i].components.get_mut(k).map(|x| &mut x.shape) else {
                         return Err(bad(c, "not a colour range component"));
                     };
                     if !add {
                         samples.clear();
                     }
-                    if samples.len() < 5 {
+                    *area = boxed;
+                    if let Some(lab) = lab
+                        && samples.len() < 5
+                    {
                         samples.push(lab);
                     }
-                    out = samples.clone();
+                    *picked = [Some(a), b].into_iter().flatten().collect();
+                    out = json!({"samples": samples, "area": area});
                     Ok(())
                 })?;
-                Ok(json!({"samples": out}))
+                Ok(out)
+            }
+        ),
+        cmd!(
+            "mask.sampleLuminance",
+            "Sample Mask Luminance",
+            [],
+            None,
+            "{x, y: normalized image point} or {x0, y0, x1, y1: an area's corners}, id?, component? — the luminance range of the selected mask (its first luminance-range component) takes the lightness there (a ranked range: the rank in the photo): fully selected 0.1 either side of a point (an area: from its darkest to its lightest), fading out over 0.25 more (ranked: a bound within 0.15 of an end goes to it) → {lo, hi, lo_feather, hi_feather}",
+            has_active,
+            |s, p| {
+                let c = "mask.sampleLuminance";
+                let (a, b) = picked_points(p, c)?;
+                let id = s.active().ok_or_else(|| bad(c, "no active photo"))?;
+                let src = s.source_now(id, crate::media::SourceLevel::Thumb).map_err(|e| bad(c, e))?;
+                let info = s.source_info(id);
+                let d = s.develop_of(id).unwrap_or_default();
+                let mid = mask_id(p, s.active_mask, c)?;
+                let comp = p.get("component").and_then(Value::as_u64).map(|v| v as usize);
+                let ranked = d.masks.iter().find(|m| m.id == mid).is_some_and(|m| {
+                    let k = comp.or_else(|| m.components.iter().position(|x| matches!(x.shape, MaskShape::LuminanceRange { .. })));
+                    k.and_then(|k| m.components.get(k)).is_some_and(|x| matches!(x.shape, MaskShape::LuminanceRange { ranked: true, .. }))
+                });
+                let req = lightcraft_pipeline::RenderRequest::fit(384, 384);
+                let (l, u) = lightcraft_pipeline::luminance_sample(&src, &info, &d, &req, a, b, ranked).ok_or_else(|| bad(c, "outside the photo"))?;
+                let range = if ranked {
+                    lightcraft_pipeline::masks::picked_ranked_range(l, u)
+                } else {
+                    lightcraft_pipeline::masks::picked_luminance_range(l, u)
+                };
+                masks_edit(s, c, "Luminance Range", |masks, _| {
+                    let i = find(masks, mid, c)?;
+                    let k = comp
+                        .or_else(|| masks[i].components.iter().position(|x| matches!(x.shape, MaskShape::LuminanceRange { .. })))
+                        .ok_or_else(|| bad(c, "the mask has no luminance range"))?;
+                    let Some(MaskShape::LuminanceRange { lo, hi, lo_feather, hi_feather, picked, .. }) =
+                        masks[i].components.get_mut(k).map(|x| &mut x.shape)
+                    else {
+                        return Err(bad(c, "not a luminance range component"));
+                    };
+                    (*lo, *hi, *lo_feather, *hi_feather) = range;
+                    *picked = [Some(a), b].into_iter().flatten().collect();
+                    Ok(())
+                })?;
+                let (lo, hi, lo_feather, hi_feather) = range;
+                Ok(json!({"lo": lo, "hi": hi, "lo_feather": lo_feather, "hi_feather": hi_feather}))
             }
         ),
         cmd!(
@@ -699,7 +777,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Edit Mask Component",
             [],
             None,
-            "{id?, component: index, action: invert|duplicate|delete|rename|op, name? (rename; empty clears), op?: add|subtract|intersect} — one component of a mask (deleting the last one deletes the mask)",
+            "{id?, component: index, action: invert|hide|duplicate|delete|rename|op, name? (rename, empty clears; duplicate: the copy's), op?: add|subtract|intersect} — one component of a mask (hide: left out of the mask, again: back in; deleting the last one deletes the mask)",
             has_active,
             |s, p| {
                 let c = "mask.component";
@@ -712,22 +790,28 @@ pub fn specs() -> Vec<CommandSpec> {
                 };
                 let label = match action.as_str() {
                     "invert" => "Invert Component",
+                    "hide" => "Show/Hide Component",
                     "duplicate" => "Duplicate Component",
                     "delete" => "Delete Component",
                     "rename" => "Rename Component",
                     "op" => "Change Component Mode",
-                    a => return Err(bad(c, format!("unknown action {a:?} (invert|duplicate|delete|rename|op)"))),
+                    a => return Err(bad(c, format!("unknown action {a:?} (invert|hide|duplicate|delete|rename|op)"))),
                 };
+                let name = str_param(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
                 masks_edit(s, c, label, |masks, active| {
                     let i = find(masks, mid, c)?;
                     let comps = &mut masks[i].components;
                     let comp = comps.get_mut(k).ok_or_else(|| bad(c, "no such component"))?;
                     match action.as_str() {
                         "invert" => comp.invert = !comp.invert,
-                        "rename" => comp.name = str_param(p, "name").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string),
+                        "hide" => comp.hidden = !comp.hidden,
+                        "rename" => comp.name = name,
                         "op" => comp.op = op.ok_or_else(|| bad(c, "missing op"))?,
                         "duplicate" => {
-                            let copy = comp.clone();
+                            let mut copy = comp.clone();
+                            if name.is_some() {
+                                copy.name = name;
+                            }
                             comps.insert(k + 1, copy);
                         }
                         _ => {

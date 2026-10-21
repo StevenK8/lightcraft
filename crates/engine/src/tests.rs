@@ -98,6 +98,38 @@ fn reset_edits_restores_a_raws_import_defaults() {
 }
 
 #[test]
+fn custom_white_balance_keeps_the_one_in_effect() {
+    use lightcraft_develop::WbMode;
+    let mut s = demo();
+    let id = s.active().unwrap();
+    s.execute("develop.wb", &json!({"mode": "custom", "temp": 7000, "tint": 5})).unwrap();
+    // picked from the list without values, Custom names the white balance in effect (it went back to the shot's)
+    s.execute("develop.wb", &json!({"mode": "custom"})).unwrap();
+    let d = active_dev(&s);
+    assert_eq!((d.wb.mode, d.wb.temp, d.wb.tint), (WbMode::Custom, 7000.0, 5.0));
+    s.execute("develop.wb", &json!({"mode": "asShot"})).unwrap();
+    s.execute("develop.wb", &json!({"mode": "custom"})).unwrap();
+    let info = s.source_info(id);
+    assert_eq!((active_dev(&s).wb.temp, active_dev(&s).wb.tint), (info.as_shot_temp, info.as_shot_tint));
+}
+
+#[test]
+fn reset_returns_the_photo_to_what_was_asked() {
+    let mut s = demo();
+    let id = s.active().unwrap();
+    s.execute("develop.set", &json!({"values": {"light.exposure": 1.0, "crop.angle": 3.0}})).unwrap();
+    // Adjustments: back to the defaults, the crop kept
+    s.execute("develop.reset", &json!({"to": "adjustments"})).unwrap();
+    assert_eq!(active_dev(&s).light.exposure, 0.0);
+    assert_eq!(active_dev(&s).crop.geometry.angle, 3.0);
+    // All: the crop too
+    s.execute("develop.reset", &json!({"to": "default"})).unwrap();
+    assert_eq!(active_dev(&s).crop.geometry.angle, 0.0);
+    assert!(s.execute("develop.reset", &json!({"to": "later"})).is_err());
+    assert_eq!(s.active(), Some(id));
+}
+
+#[test]
 fn demo_library_loads() {
     let mut s = demo();
     assert_eq!(s.visible().len(), 24);
@@ -177,6 +209,31 @@ fn albums_crud() {
     assert!(s.catalog.album(lightcraft_catalog::AlbumId(a)).is_none());
     assert!(s.catalog.album(lightcraft_catalog::AlbumId(f)).is_none());
     assert_eq!(s.catalog.photos().count(), 24, "album deletion keeps the photos");
+}
+
+/// Given a folder holding an album and a folder with an album of its own, when it's deleted with
+/// its contents, then all four go in one step (the photos stay), the view leaves an album that went,
+/// and one undo brings them all back where they were.
+#[test]
+fn a_folder_goes_with_its_contents_in_one_step() {
+    let mut s = demo();
+    let photos = s.catalog.len();
+    let f = s.execute("album.create", &json!({"name": "Trips", "folder": true})).unwrap()["id"].as_u64().unwrap();
+    let a = s.execute("album.create", &json!({"name": "Best", "parent": f, "addSelected": true})).unwrap()["id"].as_u64().unwrap();
+    let g = s.execute("album.create", &json!({"name": "2026", "parent": f, "folder": true})).unwrap()["id"].as_u64().unwrap();
+    let b = s.execute("album.create", &json!({"name": "Alps", "parent": g})).unwrap()["id"].as_u64().unwrap();
+    s.execute("library.source", &json!({"kind": "album", "id": b})).unwrap();
+    s.execute("album.delete", &json!({"id": f, "contents": true})).unwrap();
+    for id in [f, a, g, b] {
+        assert!(s.catalog.album(lightcraft_catalog::AlbumId(id)).is_none(), "{id} deleted");
+    }
+    assert_eq!(s.catalog.len(), photos, "the photos stay");
+    assert_eq!(s.source, crate::LibrarySource::All);
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert_eq!(s.catalog.album(lightcraft_catalog::AlbumId(b)).unwrap().parent, Some(lightcraft_catalog::AlbumId(g)));
+    assert_eq!(s.catalog.album(lightcraft_catalog::AlbumId(g)).unwrap().parent, Some(lightcraft_catalog::AlbumId(f)));
+    assert_eq!(s.catalog.album(lightcraft_catalog::AlbumId(a)).unwrap().photos.len(), 1);
+    assert!(s.execute("album.delete", &json!({"id": 9999, "contents": true})).is_err(), "no such album");
 }
 
 /// Given an album and a folder, when something is created inside each, then only the folder
@@ -406,6 +463,13 @@ fn masks_crop_and_render() {
     let d = active_dev(&s);
     assert_eq!(d.masks.len(), 1);
     assert_eq!(d.masks[0].components.len(), 2);
+    // the reference's brush is kept as such (and saved only when set)
+    s.execute("mask.brushStroke", &json!({"points": [[0.6, 0.6], [0.7, 0.7]], "feather": 100, "flow": 50, "spread": true})).unwrap();
+    let d = active_dev(&s);
+    let lightcraft_develop::MaskShape::Brush { strokes } = &d.masks[0].components[1].shape else { panic!() };
+    assert_eq!(strokes.iter().map(|st| st.spread).collect::<Vec<_>>(), [false, true]);
+    let saved = serde_json::to_value(&strokes[0]).unwrap();
+    assert!(saved.get("spread").is_none() && serde_json::to_value(&strokes[1]).unwrap()["spread"] == json!(true));
     s.execute("crop.aspect", &json!({"aspect": "1x1"})).unwrap();
     s.execute("crop.straighten", &json!({"angle": 5.0})).unwrap();
     let id = s.active().unwrap();
@@ -1036,6 +1100,104 @@ fn color_range_sampling_selects_the_clicked_colour() {
     // a plain click starts over
     assert_eq!(s.execute("mask.sampleColor", &json!({"x": 0.5, "y": 0.5})).unwrap()["samples"].as_array().unwrap().len(), 1);
     assert!(s.execute("mask.sampleColor", &json!({"x": 1.5, "y": 0.5})).is_err());
+    // an area over petals and leaves takes both colours instead of the samples, and keeps where it was
+    let r = s.execute("mask.sampleColor", &json!({"x0": 0.3, "y0": 0.3, "x1": 0.7, "y1": 0.7})).unwrap();
+    assert!(r["samples"].as_array().unwrap().is_empty() && r["area"].is_array(), "{r}");
+    let img = mask(&mut s);
+    assert!(at(&img, 0.5, 0.5) > 200 && at(&img, 0.03, 0.03) > 200, "both colours selected: {} {}", at(&img, 0.5, 0.5), at(&img, 0.03, 0.03));
+    let Some(lightcraft_develop::MaskShape::ColorRange { picked, .. }) =
+        s.develop_of(id).unwrap().masks[0].components.first().map(|c| c.shape.clone())
+    else {
+        panic!()
+    };
+    assert_eq!(picked.len(), 2, "the area's corners");
+    // a point after it is a point again
+    let r = s.execute("mask.sampleColor", &json!({"x": 0.5, "y": 0.5})).unwrap();
+    assert!(r["area"].is_null() && r["samples"].as_array().unwrap().len() == 1, "{r}");
+    assert!(s.execute("mask.sampleColor", &json!({"x0": 1.2, "y0": 1.2, "x1": 1.5, "y1": 1.5})).is_err());
+}
+
+/// A hue-first colour range (as the reference selects) keeps the sampled colour as it is (not
+/// toned down) and selects the clicked colour.
+#[test]
+fn hue_first_color_range_samples_the_scene_colour() {
+    use lightcraft_develop::MaskShape;
+    use lightcraft_pipeline::{MaskView, Overlay};
+    let mut s = demo();
+    let id = s.catalog.photos().find(|p| p.meta.keywords.iter().any(|k| k == "flower")).unwrap().id;
+    s.execute("library.select", &json!({"ids": [id.0]})).unwrap();
+    s.execute("mask.add", &json!({"kind": "colorRange"})).unwrap();
+    s.execute("mask.add", &json!({"kind": "colorRange", "hueFirst": true})).unwrap();
+    let masks = s.develop_of(id).unwrap().masks.clone();
+    let (old, new) = (masks[0].id, masks[1].id);
+    for m in [old, new] {
+        s.execute("mask.sampleColor", &json!({"x": 0.5, "y": 0.5, "id": m})).unwrap();
+    }
+    let shape = |s: &Session, i: usize| s.develop_of(id).unwrap().masks[i].components[0].shape.clone();
+    let (MaskShape::ColorRange { samples: a, hue_first: false, .. }, MaskShape::ColorRange { samples: b, hue_first: true, .. }) =
+        (shape(&s, 0), shape(&s, 1))
+    else {
+        panic!("{:?} {:?}", shape(&s, 0), shape(&s, 1))
+    };
+    assert!(b[0][0] > a[0][0], "not toned down: L {} vs {}", b[0][0], a[0][0]);
+    assert_eq!(serde_json::to_value(shape(&s, 1)).unwrap()["hue_first"], json!(true));
+    let job = s.render_job(id, 200, 200, false, true).unwrap().with_overlay(Overlay::Mask {
+        id: new as u16,
+        view: MaskView::WhiteOnBlack,
+        color: [255, 0, 0],
+        opacity: 100,
+    });
+    let img = job.run().rendered.unwrap().image;
+    let centre = img.data[img.height / 2 * img.width + img.width / 2][0];
+    assert!(centre > 200, "the clicked colour is selected: {centre}");
+}
+
+#[test]
+fn luminance_picker_selects_round_the_sampled_lightness() {
+    use lightcraft_develop::MaskShape;
+    use lightcraft_pipeline::masks::lightness_from_range;
+    let mut s = demo();
+    s.execute("mask.add", &json!({"kind": "luminanceRange"})).unwrap();
+    let shape = |s: &Session| active_dev(s).masks[0].components[0].shape.clone();
+    let r = s.execute("mask.sampleLuminance", &json!({"x": 0.5, "y": 0.5})).unwrap();
+    let MaskShape::LuminanceRange { lo, hi, lo_feather, hi_feather, picked, .. } = shape(&s) else { panic!() };
+    assert_eq!((r["lo"].as_f64(), r["hi"].as_f64()), (Some(lo), Some(hi)));
+    assert_eq!(picked.len(), 1);
+    // 0.1 of lightness either side, fading over 0.25 more (unless it meets black or white)
+    let (l0, l1) = (lightness_from_range(lo), lightness_from_range(hi));
+    assert!(l1 <= 1.0 && l0 >= 0.0 && l1 - l0 <= 0.2 + 1e-9 && l1 > l0, "{l0} {l1}");
+    assert!(lo_feather > 0.0 && hi_feather >= 0.0);
+    // an area: from its darkest to its lightest
+    s.execute("mask.sampleLuminance", &json!({"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0})).unwrap();
+    let MaskShape::LuminanceRange { lo: a, hi: b, picked, .. } = shape(&s) else { panic!() };
+    assert!(b - a > hi - lo, "a whole photo spans more than a point: {a}..{b} vs {lo}..{hi}");
+    assert_eq!(picked.len(), 2);
+    assert!(s.execute("mask.sampleLuminance", &json!({"x": -0.5, "y": 0.5})).is_err());
+    // one undo step each
+    s.execute("edit.undo", &json!({})).unwrap();
+    assert!(matches!(shape(&s), MaskShape::LuminanceRange { picked, .. } if picked.len() == 1));
+}
+
+#[test]
+fn ranked_luminance_picker_takes_the_rank_in_the_photo() {
+    use lightcraft_develop::MaskShape;
+    let mut s = demo();
+    s.execute("mask.add", &json!({"kind": "luminanceRange", "ranked": true, "lo": 0.0, "hi": 1.0})).unwrap();
+    let shape = |s: &Session| active_dev(s).masks[0].components[0].shape.clone();
+    assert!(matches!(shape(&s), MaskShape::LuminanceRange { ranked: true, .. }));
+    // the whole photo spans (nearly) every rank: both bounds go to their ends, unfeathered
+    s.execute("mask.sampleLuminance", &json!({"x0": 0.0, "y0": 0.0, "x1": 1.0, "y1": 1.0})).unwrap();
+    let MaskShape::LuminanceRange { lo, hi, lo_feather, hi_feather, .. } = shape(&s) else { panic!() };
+    assert_eq!((lo, hi, lo_feather, hi_feather), (0.0, 1.0, 0.0, 0.0));
+    // a point: 0.1 either side of its rank (a bound near an end goes to it)
+    s.execute("mask.sampleLuminance", &json!({"x": 0.5, "y": 0.5})).unwrap();
+    let MaskShape::LuminanceRange { lo, hi, lo_feather, hi_feather, .. } = shape(&s) else { panic!() };
+    assert!(hi - lo <= 0.2 + 1e-9 || lo == 0.0 || hi == 1.0, "{lo}..{hi}");
+    assert!((lo == 0.0) == (lo_feather == 0.0) && (hi == 1.0) == (hi_feather == 0.0), "{lo} {lo_feather} {hi} {hi_feather}");
+    // saved without its table, read back as ranked
+    let saved = serde_json::to_value(shape(&s)).unwrap();
+    assert_eq!(saved["ranked"], json!(true));
+    assert!(saved.get("ranks").is_none());
 }
 
 #[test]
@@ -1143,6 +1305,14 @@ fn mask_components_invert_duplicate_rename_change_mode_and_delete() {
     assert_eq!(mask(&s).components[1].name.as_deref(), Some("Face"));
     assert!(s.execute("mask.component", &json!({"component": 9, "action": "invert"})).is_err());
     assert!(s.execute("mask.component", &json!({"component": 0, "action": "explode"})).is_err());
+    // hide leaves a component out, again brings it back; a duplicate can be named
+    s.execute("mask.component", &json!({"component": 2, "action": "hide"})).unwrap();
+    assert!(mask(&s).components[2].hidden);
+    s.execute("mask.component", &json!({"component": 2, "action": "hide"})).unwrap();
+    assert!(!mask(&s).components[2].hidden);
+    s.execute("mask.component", &json!({"component": 2, "action": "duplicate", "name": "Linear Gradient 1 Copy"})).unwrap();
+    assert_eq!(mask(&s).components[3].name.as_deref(), Some("Linear Gradient 1 Copy"));
+    s.execute("edit.undo", &json!({})).unwrap();
     // deleting the last component deletes the mask
     for _ in 0..3 {
         s.execute("mask.component", &json!({"id": id, "component": 0, "action": "delete"})).unwrap();
@@ -1197,7 +1367,7 @@ fn ai_masks_without_the_model_explain_themselves() {
     let mut d = (*s.develop_of(id).unwrap()).clone();
     d.masks.push(lightcraft_develop::Mask {
         id: 1,
-        components: vec![lightcraft_develop::MaskComponent { name: None, op: lightcraft_develop::MaskOp::Add, invert: false, shape }],
+        components: vec![lightcraft_develop::MaskComponent { hidden: false, name: None, op: lightcraft_develop::MaskOp::Add, invert: false, shape }],
         ..Default::default()
     });
     s.set_develop(id, d, "test").unwrap();

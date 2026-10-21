@@ -48,6 +48,8 @@ pub struct Filter {
     /// A person: photos with a named face region of this name (case-insensitive), as read from XMP.
     pub person: Option<String>,
     pub camera: Option<String>,
+    /// A place: photos whose place name ([`place_of`]) is this one (case-insensitive).
+    pub place: Option<String>,
     /// Lens (case-insensitive substring).
     pub lens: Option<String>,
     /// Capture date range, inclusive: `dateFrom` is compared as a lower bound (`2026-04-01`),
@@ -240,6 +242,7 @@ impl Filter {
             ("keyword", &self.keyword),
             ("person", &self.person),
             ("camera", &self.camera),
+            ("place", &self.place),
             ("lens", &self.lens),
             ("date", &self.date),
             ("folder", &self.library_folder),
@@ -409,8 +412,20 @@ impl Filter {
         {
             return false;
         }
+        if let Some(w) = &self.place
+            && !place_of(p).eq_ignore_ascii_case(w.trim())
+        {
+            return false;
+        }
         self.text.split_whitespace().all(|tok| token_matches(p, tok))
     }
+}
+
+/// Where a photo was taken, as one name: its city, else its state or province, else its country,
+/// else its location line (IPTC metadata); empty when it has none of them.
+pub fn place_of(p: &Photo) -> &str {
+    let m = &p.meta;
+    [&m.city, &m.state, &m.country, &m.location].into_iter().map(|s| s.trim()).find(|s| !s.is_empty()).unwrap_or("")
 }
 
 /// Case-insensitive file name order without allocating (compares per-character lowercase via `char::to_lowercase`).
@@ -505,6 +520,19 @@ impl Catalog {
             }
         }
         m.into_iter().collect()
+    }
+
+    /// The places photos were taken ([`place_of`]) with how many photos each, by name; names that
+    /// differ only in case are one place, shown as first seen.
+    pub fn places(&self) -> Vec<(String, usize)> {
+        let mut m: std::collections::BTreeMap<String, (String, usize)> = Default::default();
+        for p in self.photos().filter(|p| p.in_library()) {
+            let place = place_of(p);
+            if !place.is_empty() {
+                m.entry(place.to_lowercase()).or_insert_with(|| (place.to_string(), 0)).1 += 1;
+            }
+        }
+        m.into_values().collect()
     }
 
     /// The people named on faces in the library (MWG regions read from XMP): how many photos each

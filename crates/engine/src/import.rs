@@ -109,6 +109,10 @@ pub struct ImportOptions {
     pub metadata_preset: Option<String>,
     /// Copy: raws are copied as DNG (Copy as DNG).
     pub convert_dng: bool,
+    /// A file with the same content as a photo the library has comes in as a new photo anyway
+    /// (the person chose to import the duplicate); a file already in the library by path is
+    /// still skipped.
+    pub import_duplicates: bool,
 }
 
 /// How copies are filed in the destination. The date is the capture time, else the time of the
@@ -1065,6 +1069,7 @@ impl ImportJob {
             }
             if let Some(h) = &info.content_hash
                 && !opts.local
+                && !opts.import_duplicates
                 && let Some(existing) = self.by_hash.get(h)
             {
                 self.done.fetch_add(1, Relaxed);

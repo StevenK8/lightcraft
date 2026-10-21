@@ -516,7 +516,7 @@ fn range_controls(app: &mut LightcraftApp, ui: &mut egui::Ui, comp: usize, shape
         let _ = app.run("mask.update", json!({"component": comp, "shape": shape}));
     };
     match shape {
-        MaskShape::LuminanceRange { lo, hi, lo_feather, hi_feather } => {
+        MaskShape::LuminanceRange { lo, hi, lo_feather, hi_feather, picked, ranked, .. } => {
             ui.label(egui::RichText::new(crate::i18n::tr("Select Luminance Range")).color(t.text_dim).size(11.5));
             let (lo, hi) = (*lo, *hi);
             let w = ui.available_width().min(240.0);
@@ -563,7 +563,18 @@ fn range_controls(app: &mut LightcraftApp, ui: &mut egui::Ui, comp: usize, shape
                 let low =
                     if resp.dragged() { ui.data(|d| d.get_temp::<bool>(handle_id)).unwrap_or_else(|| nearer_low(pos.x)) } else { nearer_low(pos.x) };
                 let (nlo, nhi) = if low { (v.min((hi - 0.01).max(0.0)), hi) } else { (lo, v.max((lo + 0.01).min(1.0))) };
-                update(app, MaskShape::LuminanceRange { lo: nlo, hi: nhi, lo_feather: *lo_feather, hi_feather: *hi_feather });
+                update(
+                    app,
+                    MaskShape::LuminanceRange {
+                        lo: nlo,
+                        hi: nhi,
+                        lo_feather: *lo_feather,
+                        hi_feather: *hi_feather,
+                        picked: picked.clone(),
+                        ranked: *ranked,
+                        ranks: None,
+                    },
+                );
             }
             if resp.drag_stopped() {
                 ui.data_mut(|d| d.remove::<bool>(handle_id));
@@ -585,7 +596,10 @@ fn range_controls(app: &mut LightcraftApp, ui: &mut egui::Ui, comp: usize, shape
             let out = slider(ui, &smooth, cur, true, None);
             apply_slider_out(app, &smooth, out, |app, v| {
                 let f = v / 100.0 * 0.5;
-                app.run("mask.update", json!({"component": comp, "shape": MaskShape::LuminanceRange { lo, hi, lo_feather: f, hi_feather: f }}))
+                app.run(
+                    "mask.update",
+                    json!({"component": comp, "shape": MaskShape::LuminanceRange { lo, hi, lo_feather: f, hi_feather: f, picked: picked.clone(), ranked: *ranked, ranks: None }}),
+                )
             });
             let mut map = app.ui.mask_overlay && app.ui.mask_overlay_mode == "colorOnBw";
             let r = ui.checkbox(&mut map, crate::i18n::tr("Show Luminance Map"));
@@ -627,7 +641,7 @@ fn range_controls(app: &mut LightcraftApp, ui: &mut egui::Ui, comp: usize, shape
             });
             ui.label(egui::RichText::new(crate::i18n::tr("− harder border · + softer border")).color(t.text_dim).size(11.0));
         }
-        MaskShape::ColorRange { samples, refine } => {
+        MaskShape::ColorRange { samples, refine, area, picked, hue_first } => {
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(crate::i18n::tr_format!("{} sample{}", samples.len(), if samples.len() == 1 { "" } else { "s" }))
@@ -656,7 +670,10 @@ fn range_controls(app: &mut LightcraftApp, ui: &mut egui::Ui, comp: usize, shape
             let out = slider(ui, &spec, *refine, true, None);
             let samples = samples.clone();
             apply_slider_out(app, &spec, out, |app, v| {
-                app.run("mask.update", json!({"component": comp, "shape": MaskShape::ColorRange { samples: samples.clone(), refine: v }}))
+                app.run(
+                    "mask.update",
+                    json!({"component": comp, "shape": MaskShape::ColorRange { samples: samples.clone(), refine: v, area: area.clone(), picked: picked.clone(), hue_first: *hue_first }}),
+                )
             });
         }
         _ => {}

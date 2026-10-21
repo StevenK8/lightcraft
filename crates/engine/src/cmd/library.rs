@@ -86,8 +86,14 @@ pub fn import_params(s: &Session, p: &Value) -> Result<ImportRequest> {
         }
         None => Default::default(),
     };
+    let import_duplicates = match str_param(p, "duplicates") {
+        None | Some("skip") => false,
+        Some("import") => true,
+        Some(v) => return Err(bad("library.import", format!("unknown duplicates `{v}` (skip|import)"))),
+    };
     let opts = crate::import::ImportOptions {
         on_deleted,
+        import_duplicates,
         mode,
         preset,
         keywords: strs(p, "keywords"),
@@ -407,7 +413,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Filter",
             [],
             None,
-            "partial Filter: {text?, rating?, ratingOp?: atLeast|exactly|atMost, flag?: pick|reject|none|null, label?, kind?, merged?: hdr|panorama|hdrPanorama|any, edited?, date?, libraryFolder?: a path from library.folders, keyword?, person?, camera?}",
+            "partial Filter: {text?, rating?, ratingOp?: atLeast|exactly|atMost, flag?: pick|reject|none|null, label?, kind?, merged?: hdr|panorama|hdrPanorama|any, edited?, date?, libraryFolder?: a path from library.folders, keyword?, person?, camera?, place?}",
             always,
             |s, p| {
                 let mut v = serde_json::to_value(&s.filter).unwrap_or_default();
@@ -1144,7 +1150,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Delete Album",
             [],
             None,
-            "{id} — deletes the album or folder and its descendants, keeping photos in the library; one undo step",
+            "{id, contents?: bool (accepted for the phone app, which sends it for folders; deleting a folder always deletes the albums and folders inside it, keeping the photos); one undo step}",
             always,
             |s, p| {
                 let id = album_param(p, "id", "album.delete")?;

@@ -24,6 +24,7 @@ fn masked(s: &mut DevelopSettings, k: usize) {
         s.masks.push(Mask {
             id: i as u32 + 1,
             components: vec![MaskComponent {
+                hidden: false,
                 name: None,
                 op: MaskOp::Add,
                 invert: false,
@@ -83,6 +84,22 @@ fn failed_gpu_renders_fall_back_with_a_reason() {
     assert!(why.contains("exceeds"), "{why}");
     assert!(lightcraft_gpu::available(), "{:?}", lightcraft_gpu::unavailable_reason());
     ok("after the limit faults");
+
+    // a device that can't index this many pixels (Android): the output over the cap is refused up
+    // front and the GPU stays in use; a source over it (a smaller render of a large photo) is
+    // sampled on the CPU and the rest still renders on the GPU, as the CPU would
+    lightcraft_gpu::inject_fault(Fault::Pixels(w * h - 1));
+    let why = failed("output over the pixel cap");
+    assert!(why.contains("pixels"), "{why}");
+    assert!(lightcraft_gpu::available(), "a pixel cap is no device failure");
+    let half = RenderRequest::fit(w / 2, h / 2);
+    let cpu_half = render(&src, &info, &s, &half).image;
+    lightcraft_gpu::inject_fault(Fault::Pixels(w * h / 2));
+    let g =
+        lightcraft_gpu::render(&src, &info, &s, &half, None).unwrap_or_else(|| panic!("sampled on the CPU: {:?}", lightcraft_gpu::last_fallback()));
+    let d = mean_abs_diff(&cpu_half, &g.image);
+    assert!(d < 0.5, "a source over the cap: GPU differs from the CPU by {d:.3} LSB");
+    ok("after the pixel caps");
 
     // a device (validation) error: captured by the render's error scope; the GPU is not used again
     // on this thread — other threads keep it (a simulated failure, not a real one)
