@@ -408,7 +408,7 @@ fn slideshow_playback_settings_persist_with_the_library() {
         let r = s
             .execute(
                 "slideshow.playback",
-                &json!({"slideDuration": 6, "fadeDuration": 2.5, "fadeColor": "#000000", "randomOrder": true, "repeat": false}),
+                &json!({"slideDuration": 6, "fadeDuration": 2.5, "fadeColor": "#000000", "randomOrder": true, "repeat": false, "manual": true}),
             )
             .unwrap();
         assert_eq!(r["fadeColor"], "#000000");
@@ -422,7 +422,7 @@ fn slideshow_playback_settings_persist_with_the_library() {
     let r = s.execute("slideshow.playback", &json!({})).unwrap();
     assert_eq!(
         r,
-        json!({"slideDuration": 6.0, "fadeDuration": 2.5, "fadeColor": "#000000", "randomOrder": true, "repeat": false, "preparePreviews": true})
+        json!({"slideDuration": 6.0, "fadeDuration": 2.5, "fadeColor": "#000000", "randomOrder": true, "repeat": false, "preparePreviews": true, "manual": true})
     );
     drop(s);
     // out-of-range values written by hand are clamped when the library opens
